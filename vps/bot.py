@@ -28,6 +28,20 @@ from keyboards import (
 )
 from security.rate_limit import RateLimiter, should_bypass_rate_limit
 from security.redaction import redact_secrets as redact_secret_values
+from training import (
+    build_editorial_memory_auto_block,
+    bad_source_rows,
+    format_bad_sources,
+    format_daily_training_report,
+    format_good_topics,
+    format_source_quality,
+    format_training_status,
+    good_topic_rows,
+    source_quality_rows,
+    training_status as build_training_status,
+    update_editorial_memory_file,
+    update_training_editorial_memory,
+)
 
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -119,6 +133,7 @@ SCHEDULER_TIMEZONE = os.environ.get("SCHEDULER_TIMEZONE") or "Asia/Yekaterinburg
 LOG_DIR = BASE_DIR / "logs"
 LLM_USAGE_LOG_PATH = LOG_DIR / "llm_usage.md"
 CHINA_DAILY_STATS_PATH = BASE_DIR / "china_monitor" / "logs" / "daily_stats.md"
+TRAINING_STATE_PATH = LOG_DIR / "training_7d_state.env"
 ERROR_TRACEBACK_CHARS = int(os.environ.get("ERROR_TRACEBACK_CHARS") or "2800")
 SCHEDULER = None
 COMMAND_RATE_LIMITER = RateLimiter(
@@ -1295,6 +1310,9 @@ def build_daily_report_text() -> str:
         lines.extend(["", "Топ тем дня:"])
         for topic, count in sorted(topic_counts.items(), key=lambda item: item[1], reverse=True)[:5]:
             lines.append(f"- {topic}: {count}")
+    training_block = format_daily_training_report(DB_PATH, TRAINING_STATE_PATH)
+    if training_block:
+        lines.append(training_block)
     return "\n".join(lines)
 
 
@@ -1409,61 +1427,59 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await show_quality_stats(update, stats_days_from_text(update.message.text or ""))
 
 
+def command_days(update: Update, context: ContextTypes.DEFAULT_TYPE, default: int = 7) -> int:
+    values = list(getattr(context, "args", []) or [])
+    if update.message and update.message.text:
+        values.extend(update.message.text.split()[1:])
+    for value in values:
+        try:
+            days = int(value)
+            if days in {7, 30, 90}:
+                return days
+        except Exception:
+            continue
+    return default
+
+
+async def training_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != REVIEW_CHAT_ID and update.effective_chat.id != ADMIN_TELEGRAM_ID:
+        return
+    if not await enforce_rate_limit(update):
+        return
+    await update.message.reply_text(format_training_status(build_training_status(DB_PATH, TRAINING_STATE_PATH)))
+
+
+async def source_quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != REVIEW_CHAT_ID and update.effective_chat.id != ADMIN_TELEGRAM_ID:
+        return
+    if not await enforce_rate_limit(update):
+        return
+    days = command_days(update, context, default=7)
+    await update.message.reply_text(format_source_quality(source_quality_rows(DB_PATH, days=days), days=days))
+
+
+async def bad_sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != REVIEW_CHAT_ID and update.effective_chat.id != ADMIN_TELEGRAM_ID:
+        return
+    if not await enforce_rate_limit(update):
+        return
+    days = command_days(update, context, default=7)
+    await update.message.reply_text(format_bad_sources(bad_source_rows(DB_PATH, days=days), days=days))
+
+
+async def good_topics_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != REVIEW_CHAT_ID and update.effective_chat.id != ADMIN_TELEGRAM_ID:
+        return
+    if not await enforce_rate_limit(update):
+        return
+    days = command_days(update, context, default=7)
+    await update.message.reply_text(format_good_topics(good_topic_rows(DB_PATH, days=days), days=days))
+
+
 def build_generated_editorial_memory() -> str:
     if not HISTORY_DB:
         return ""
-    stats = HISTORY_DB.get_statistics(days=90)
-    feedback = HISTORY_DB.get_recent_feedback(limit=50)
-    rejection_reasons: dict[str, int] = {}
-    for item in feedback:
-        if item.get("action") in {"rejected", "bad_media"} and item.get("feedback_text"):
-            reason = clean_visible_text(item["feedback_text"])[:90]
-            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
-
-    general = stats["general"]
-    lines = [
-        "<!-- AUTO_HISTORY_START -->",
-        "# Auto Editorial Memory",
-        "",
-        "Автоматически обновляется на основе решений владельца.",
-        f"Последнее обновление: {time.strftime('%Y-%m-%d %H:%M')}",
-        "Период анализа: 90 дней",
-        "",
-        "## Общая статистика",
-        "",
-        f"- Всего черновиков: {general['total_drafts']}",
-        f"- Approval rate: {general['approval_rate']}%",
-        f"- С медиа: {general['with_media']}",
-        f"- Плохое медиа: {general['bad_media']}",
-        "",
-        "## Лучшие источники",
-        "",
-    ]
-    good_sources = [source for source in stats.get("top_sources", []) if (source.get("approval_rate") or 0) >= 60]
-    lines.extend(
-        [f"- **{source['source_name']}**: {source['approval_rate']}% ({source['approved_count']}/{source['total_drafts']})" for source in good_sources]
-        or ["- Пока мало данных"]
-    )
-    lines.extend(["", "## Проблемные источники", ""])
-    bad_sources = [source for source in stats.get("problem_sources", []) if (source.get("approval_rate") or 0) < 30 and source.get("total_drafts", 0) >= 3]
-    lines.extend(
-        [f"- **{source['source_name']}**: {source['approval_rate']}% ({source['approved_count']}/{source['total_drafts']})" for source in bad_sources]
-        or ["- Пока мало данных"]
-    )
-    lines.extend(["", "## Темы, которые хорошо заходят", ""])
-    good_topics = [topic for topic in stats.get("topics", []) if (topic.get("approval_rate") or 0) >= 70 and topic.get("total_count", 0) >= 2]
-    lines.extend(
-        [f"- **{topic['topic_tag']}**: {topic['approval_rate']}% ({topic['approved_count']}/{topic['total_count']})" for topic in good_topics]
-        or ["- Пока мало данных"]
-    )
-    lines.extend(["", "## Частые причины отклонения", ""])
-    if rejection_reasons:
-        for reason, count in sorted(rejection_reasons.items(), key=lambda item: item[1], reverse=True)[:8]:
-            lines.append(f"- {reason} ({count})")
-    else:
-        lines.append("- Пока мало данных")
-    lines.extend(["", "<!-- AUTO_HISTORY_END -->"])
-    return "\n".join(lines) + "\n"
+    return build_editorial_memory_auto_block(DB_PATH, days=90)
 
 
 async def update_editorial_memory(update: Update) -> None:
@@ -1472,18 +1488,11 @@ async def update_editorial_memory(update: Update) -> None:
     if not HISTORY_DB:
         await update.message.reply_text("Не могу обновить память: HistoryDB не загрузился.")
         return
-    generated = build_generated_editorial_memory()
-    existing = EDITORIAL_MEMORY_PATH.read_text(encoding="utf-8") if EDITORIAL_MEMORY_PATH.exists() else "# Headway Telegram Editorial Memory\n"
-    start = "<!-- AUTO_HISTORY_START -->"
-    end = "<!-- AUTO_HISTORY_END -->"
-    if start in existing and end in existing:
-        before = existing.split(start, 1)[0].rstrip()
-        after = existing.split(end, 1)[1].lstrip()
-        content = before + "\n\n" + generated + ("\n" + after if after else "")
-    else:
-        content = generated + "\n" + existing
-    EDITORIAL_MEMORY_PATH.write_text(content.rstrip() + "\n", encoding="utf-8")
-    await update.message.reply_text("✅ editorial_memory.md обновлен на основе истории решений.")
+    result = update_editorial_memory_file(EDITORIAL_MEMORY_PATH, build_generated_editorial_memory())
+    await update.message.reply_text(
+        "✅ editorial_memory.md обновлен на основе истории решений.\n"
+        f"Секции: {', '.join(result.get('sections', []))}"
+    )
 
 
 async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1723,6 +1732,10 @@ async def draft_button_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         if action == "publish":
+            draft = load_draft(draft_path)
+            draft_id = record_history_created(draft, draft_path)
+            if HISTORY_DB:
+                HISTORY_DB.record_feedback(draft_id, "publish_confirmation_requested", "inline_publish", history_payload(draft, draft_path))
             await query.message.reply_text(
                 "Опубликовать этот черновик?",
                 reply_markup=confirm_publish_keyboard(draft_path),
@@ -1733,6 +1746,10 @@ async def draft_button_callback(update: Update, context: ContextTypes.DEFAULT_TY
         elif action == "cancel":
             await query.message.reply_text("Ок, действие отменено.")
         elif action == "find_photo":
+            draft = load_draft(draft_path)
+            draft_id = record_history_created(draft, draft_path)
+            if HISTORY_DB:
+                HISTORY_DB.record_feedback(draft_id, "find_photo_requested", "inline_find_photo", history_payload(draft, draft_path))
             await find_photo_for_draft_from_button(query, context, draft_path)
         elif action == "generate_image":
             draft = load_draft(draft_path)
@@ -1753,6 +1770,10 @@ async def draft_button_callback(update: Update, context: ContextTypes.DEFAULT_TY
             start_rewrite(target)
             await query.message.reply_text("Принял: переделаю текст и пришлю новую версию на согласование.")
         elif action == "reject":
+            draft = load_draft(draft_path)
+            draft_id = record_history_created(draft, draft_path)
+            if HISTORY_DB:
+                HISTORY_DB.record_feedback(draft_id, "reject_reason_requested", "inline_reject", history_payload(draft, draft_path))
             await query.message.reply_text(
                 "Выбери причину отклонения:",
                 reply_markup=reject_reason_keyboard(draft_path),
@@ -1798,6 +1819,9 @@ async def scheduled_daily_report(application: Application) -> None:
     if not DAILY_REPORT_ENABLED:
         return
     try:
+        if TRAINING_STATE_PATH.exists():
+            result = update_training_editorial_memory(DB_PATH, EDITORIAL_MEMORY_PATH, days=90)
+            logging.info("Training editorial memory update: %s", result)
         await application.bot.send_message(
             chat_id=ADMIN_TELEGRAM_ID,
             text=build_daily_report_text(),
@@ -2093,6 +2117,10 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("daily_report", daily_report_command))
+    app.add_handler(CommandHandler("training_status", training_status_command))
+    app.add_handler(CommandHandler("source_quality", source_quality_command))
+    app.add_handler(CommandHandler("bad_sources", bad_sources_command))
+    app.add_handler(CommandHandler("good_topics", good_topics_command))
     app.add_handler(CommandHandler("backup_now", backup_now_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("update_memory", memory_command))

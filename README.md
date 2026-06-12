@@ -252,6 +252,34 @@ sudo systemctl enable --now headway-news-monitor-training7d.timer
 sudo systemctl start headway-news-monitor-training7d.service
 ```
 
+The service runs:
+
+```bash
+/opt/headway-news-bot/.venv/bin/python /opt/headway-news-bot/monitor.py --hours "$TRAINING_LOOKBACK_HOURS" --send-review
+```
+
+It does not call channel publishing code. Publishing still requires owner approval in Telegram.
+
+Useful Telegram commands during training:
+
+- `/training_status` - shows whether training mode is active, when it started, hours left, candidates, drafts, owner publishes/rejects, rewrites, and media errors.
+- `/source_quality` - shows source quality for 7 days by default.
+- `/source_quality 30` or `/source_quality 90` - shows a longer source-quality window.
+- `/bad_sources` - shows sources with low approval, many rejects, weak facts, poor media, or off-topic drafts. The bot only recommends, it does not disable sources automatically.
+- `/good_topics` - shows topics that more often reach publication, including charging infrastructure, fast charging, China, subsidies, hubs, battery swap, and standards.
+- `/daily_report` - includes the "Обучение канала за 7 дней" block while the training state exists.
+- `/memory` or `/update_memory` - refreshes `editorial_memory.md` from history.
+
+`editorial_memory.md` keeps manual notes outside this generated block:
+
+```text
+<!-- AUTO_HISTORY_START -->
+...
+<!-- AUTO_HISTORY_END -->
+```
+
+The automatic block stores best sources, bad sources, good topics, frequent rejection reasons, media rules, and phrases to avoid.
+
 Stop manually:
 
 ```bash

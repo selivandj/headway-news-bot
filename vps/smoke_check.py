@@ -58,6 +58,7 @@ def main() -> int:
         "search/cache.py",
         "security/rate_limit.py",
         "security/redaction.py",
+        "training.py",
         "tests/test_static_guards.py",
     ):
         compile_file(relative_path, errors)
@@ -72,6 +73,7 @@ def main() -> int:
     backup_py = read_text("backup.py")
     env_loader_py = read_text("env_loader.py")
     redaction_py = read_text("security/redaction.py")
+    training_py = read_text("training.py")
     rules_md = read_text("channel_agent_rules.md")
 
     check("load_headway_env(BASE_DIR)" in bot_py, "Bot loads root and vps .env through shared loader", errors)
@@ -81,6 +83,11 @@ def main() -> int:
     check("backup_all_sqlite_databases" in backup_py, "Backup module supports all SQLite databases", errors)
     check("RATE_LIMIT_OWNER_BYPASS" in bot_py, "Owner can bypass command rate limit", errors)
     check("[REDACTED]" in redaction_py, "Secret redaction removes token fragments", errors)
+    check('CommandHandler("training_status", training_status_command)' in bot_py, "Training status command is registered", errors)
+    check('CommandHandler("source_quality", source_quality_command)' in bot_py, "Source quality command is registered", errors)
+    check('CommandHandler("bad_sources", bad_sources_command)' in bot_py, "Bad sources command is registered", errors)
+    check('CommandHandler("good_topics", good_topics_command)' in bot_py, "Good topics command is registered", errors)
+    check("AUTO_HISTORY_START" in training_py and "update_editorial_memory_file" in training_py, "Training module updates editorial memory auto block", errors)
     check("confirm_publish_keyboard" in bot_py, "Inline publish path asks for confirmation", errors)
     check("notify_monitor_failure" in monitor_py, "Monitor reports fatal failures to review chat", errors)
     check("collect_china_candidates(24, force=True)" in monitor_py, "China daily report refreshes sources before reporting", errors)

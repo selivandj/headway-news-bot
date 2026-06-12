@@ -29,6 +29,7 @@ fi
 . "$STATE_FILE"
 
 if [ "$NOW" -ge "$DEADLINE_AT" ]; then
+  echo "Training duration ended at $NOW; disabling $TIMER_NAME"
   systemctl disable --now "$TIMER_NAME" || true
   exit 0
 fi
@@ -49,5 +50,6 @@ cd "$BASE_DIR"
 
 NOW=$(date +%s)
 if [ "$NOW" -ge "$DEADLINE_AT" ]; then
+  echo "Training duration ended after this run at $NOW; disabling $TIMER_NAME"
   systemctl disable --now "$TIMER_NAME" || true
 fi
