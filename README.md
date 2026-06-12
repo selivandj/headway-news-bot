@@ -33,12 +33,18 @@ The project searches EV charging news, creates Russian Telegram drafts, attaches
 Run from `/opt/headway-news-bot`:
 
 ```bash
-./.venv/bin/python smoke_check.py
+./.venv/bin/python vps/smoke_check.py
 ./.venv/bin/python -m unittest discover -s tests -p "test_*.py"
 ./.venv/bin/python -m pytest tests
 systemctl status headway-news-bot.service --no-pager
 systemctl list-timers --all | grep headway
 ```
+
+Main runtime configuration should live in the project root `.env`:
+`/opt/headway-news-bot/.env`.
+
+For compatibility, the bot also checks `/opt/headway-news-bot/vps/.env`.
+Load order is root `.env` first, then `vps/.env` for missing values. The bot does not fail if either file is absent.
 
 ## Надежность и управление ботом
 
@@ -145,7 +151,12 @@ ssh -L 8001:localhost:8001 root@VPS_IP
 
 ### Автобэкап базы
 
-`vps/backup.py` делает gzip-бэкап SQLite и хранит последние архивы.
+`vps/backup.py` делает gzip-бэкап всех SQLite-баз из `vps/database/*.db` и хранит последние архивы.
+
+Минимально в бэкап попадают:
+
+- `history.db`
+- `image_hashes.db`, если база уже создана ImageHash-дедупликацией
 
 Настройки:
 
@@ -190,7 +201,10 @@ ADMIN_TELEGRAM_ID=117574226
 RATE_LIMIT_ENABLED=1
 RATE_LIMIT_REQUESTS=30
 RATE_LIMIT_WINDOW_SECONDS=60
+RATE_LIMIT_OWNER_BYPASS=1
 ```
+
+По умолчанию владелец не ограничивается rate limit.
 
 При превышении лимита бот отвечает: `Слишком много команд. Попробуйте позже.`
 
@@ -199,7 +213,7 @@ RATE_LIMIT_WINDOW_SECONDS=60
 ```bash
 python -m compileall vps
 python -m pytest tests -v
-python vps/smoke_check.py
+./.venv/bin/python vps/smoke_check.py
 systemctl restart headway-news-bot.service
 systemctl status headway-news-bot.service --no-pager
 ```

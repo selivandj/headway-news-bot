@@ -30,3 +30,7 @@ class RateLimiter:
             self._hits.clear()
         else:
             self._hits.pop(str(key), None)
+
+
+def should_bypass_rate_limit(is_owner: bool, owner_bypass: bool = True) -> bool:
+    return bool(is_owner and owner_bypass)

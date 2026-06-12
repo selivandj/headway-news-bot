@@ -13,12 +13,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from backup import create_sqlite_backup
+from backup import backup_all_sqlite_databases
+from env_loader import load_headway_env
 from keyboards import (
     confirm_publish_keyboard,
     draft_action_keyboard as build_draft_action_keyboard,
@@ -26,7 +26,8 @@ from keyboards import (
     reject_reason_keyboard,
     reject_reason_label,
 )
-from security.rate_limit import RateLimiter
+from security.rate_limit import RateLimiter, should_bypass_rate_limit
+from security.redaction import redact_secrets as redact_secret_values
 
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -61,6 +62,7 @@ except Exception:
     HistoryDB = None
 
 BASE_DIR = Path(__file__).resolve().parent
+ENV_FILES_LOADED = load_headway_env(BASE_DIR)
 DRAFT_DIR = BASE_DIR / "drafts"
 PUBLISHED_DIR = BASE_DIR / "published"
 CANCELLED_DIR = BASE_DIR / "cancelled"
@@ -77,12 +79,6 @@ GLOBAL_FEEDBACK_PATH = FEEDBACK_DIR / "owner_memory.log"
 for folder in (DRAFT_DIR, PUBLISHED_DIR, CANCELLED_DIR, FEEDBACK_DIR, DATABASE_DIR, VOICE_DIR, STORY_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
-IMAGE_SEARCHER = PreciseImageSearch(download_dir=STORY_DIR) if PreciseImageSearch else None
-MEDIA_STATUS_MANAGER = MediaStatusManager() if MediaStatusManager else None
-HISTORY_DB = HistoryDB(DB_PATH) if HistoryDB else None
-
-load_dotenv(BASE_DIR / ".env")
-
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 REVIEW_CHAT_ID = int(os.environ["TELEGRAM_REVIEW_CHAT_ID"])
 CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
@@ -92,6 +88,7 @@ ERROR_NOTIFICATIONS_ENABLED = os.environ.get("ERROR_NOTIFICATIONS_ENABLED", "1")
 RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
 RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS") or "30")
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS") or "60")
+RATE_LIMIT_OWNER_BYPASS = os.environ.get("RATE_LIMIT_OWNER_BYPASS", "1").lower() in {"1", "true", "yes", "on"}
 BACKUP_ENABLED = os.environ.get("BACKUP_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
 BACKUP_KEEP_DAYS = int(os.environ.get("BACKUP_KEEP_DAYS") or "14")
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR") or (BASE_DIR / "backups"))
@@ -130,6 +127,10 @@ COMMAND_RATE_LIMITER = RateLimiter(
     enabled=RATE_LIMIT_ENABLED,
 )
 
+IMAGE_SEARCHER = PreciseImageSearch(download_dir=STORY_DIR) if PreciseImageSearch else None
+MEDIA_STATUS_MANAGER = MediaStatusManager() if MediaStatusManager else None
+HISTORY_DB = HistoryDB(DB_PATH) if HistoryDB else None
+
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -138,18 +139,17 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def redact_secrets(value: str) -> str:
-    text = value or ""
-    for secret in (
-        BOT_TOKEN,
-        OPENAI_API_KEY,
-        KIMI_API_KEY,
-        OPENROUTER_API_KEY,
-        GEMINI_API_KEY,
-        GROQ_API_KEY,
-    ):
-        if secret and len(secret) > 8:
-            text = text.replace(secret, f"{secret[:4]}...{secret[-4:]}")
-    return text
+    return redact_secret_values(
+        value,
+        (
+            BOT_TOKEN,
+            OPENAI_API_KEY,
+            KIMI_API_KEY,
+            OPENROUTER_API_KEY,
+            GEMINI_API_KEY,
+            GROQ_API_KEY,
+        ),
+    )
 
 
 def is_owner(update: Update) -> bool:
@@ -168,6 +168,8 @@ async def require_owner(update: Update) -> bool:
 
 
 async def enforce_rate_limit(update: Update) -> bool:
+    if should_bypass_rate_limit(is_owner(update), RATE_LIMIT_OWNER_BYPASS):
+        return True
     user_id = update.effective_user.id if update.effective_user else None
     chat_id = update.effective_chat.id if update.effective_chat else None
     key = str(user_id or chat_id or "unknown")
@@ -1311,11 +1313,19 @@ async def backup_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if not await enforce_rate_limit(update):
         return
-    result = create_sqlite_backup(DB_PATH, BACKUP_DIR, keep_days=BACKUP_KEEP_DAYS, keep_count=BACKUP_KEEP_DAYS)
-    if result.created:
-        await update.message.reply_text(f"Бэкап создан: {result.path}")
-    else:
-        await update.message.reply_text(f"Бэкап не создан: {result.message}")
+    result = backup_all_sqlite_databases(DATABASE_DIR, BACKUP_DIR, keep_days=BACKUP_KEEP_DAYS)
+    lines = [
+        "SQLite backup",
+        f"Databases found: {result.found}",
+        f"Backups created: {result.created}",
+    ]
+    if result.paths:
+        lines.append("Created:")
+        lines.extend(f"- {Path(path).name}" for path in result.paths)
+    if result.skipped:
+        lines.append("Skipped:")
+        lines.extend(f"- {item}" for item in result.skipped)
+    await update.message.reply_text("\n".join(lines))
 
 
 def is_stats_command_text(text: str) -> bool:
@@ -1822,11 +1832,13 @@ async def scheduled_history_backup(application: Application) -> None:
     if not BACKUP_ENABLED:
         return
     try:
-        result = create_sqlite_backup(DB_PATH, BACKUP_DIR, keep_days=BACKUP_KEEP_DAYS, keep_count=BACKUP_KEEP_DAYS)
-        if result.created:
-            logging.info("Scheduled history backup created: %s", result.path)
-        else:
-            logging.info("Scheduled history backup skipped: %s", result.message)
+        result = backup_all_sqlite_databases(DATABASE_DIR, BACKUP_DIR, keep_days=BACKUP_KEEP_DAYS)
+        logging.info(
+            "Scheduled SQLite backup: found=%s created=%s skipped=%s",
+            result.found,
+            result.created,
+            len(result.skipped),
+        )
     except Exception:
         logging.exception("Scheduled history backup failed")
 

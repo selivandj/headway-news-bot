@@ -16,11 +16,20 @@ class BackupResult:
     message: str
 
 
+@dataclass(frozen=True)
+class BackupAllResult:
+    found: int
+    created: int
+    paths: list[str]
+    skipped: list[str]
+
+
 def create_sqlite_backup(
     db_path: str | Path = "vps/database/history.db",
     backup_dir: str | Path = "vps/backups",
     keep_days: int = 14,
     keep_count: int = 14,
+    cleanup: bool = True,
 ) -> BackupResult:
     db_path = Path(db_path)
     backup_dir = Path(backup_dir)
@@ -50,13 +59,58 @@ def create_sqlite_backup(
         with raw_backup.open("rb") as src, gzip.open(gz_backup, "wb") as dst:
             shutil.copyfileobj(src, dst)
         raw_backup.unlink(missing_ok=True)
-        cleanup_backups(backup_dir, keep_days=keep_days, keep_count=keep_count)
+        if cleanup:
+            cleanup_backups(backup_dir, keep_days=keep_days, keep_count=keep_count)
         logging.info("SQLite backup created: %s", gz_backup)
         return BackupResult(True, str(gz_backup), "Backup created")
     except Exception as exc:
         raw_backup.unlink(missing_ok=True)
         logging.exception("SQLite backup failed")
         return BackupResult(False, "", f"Backup failed: {exc}")
+
+
+def backup_all_sqlite_databases(
+    database_dir: str | Path = "vps/database",
+    backup_dir: str | Path = "vps/backups",
+    keep_days: int = 14,
+) -> BackupAllResult:
+    database_dir = Path(database_dir)
+    backup_dir = Path(backup_dir)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    db_paths = sorted(path for path in database_dir.glob("*.db") if path.is_file())
+    if not db_paths:
+        cleanup_backups(backup_dir, keep_days=keep_days, keep_count=keep_days)
+        return BackupAllResult(
+            found=0,
+            created=0,
+            paths=[],
+            skipped=[f"No SQLite databases found in {database_dir}"],
+        )
+
+    created_paths: list[str] = []
+    skipped: list[str] = []
+    keep_count = max(1, int(keep_days)) * max(1, len(db_paths))
+    for db_path in db_paths:
+        result = create_sqlite_backup(
+            db_path=db_path,
+            backup_dir=backup_dir,
+            keep_days=keep_days,
+            keep_count=keep_count,
+            cleanup=False,
+        )
+        if result.created:
+            created_paths.append(result.path)
+        else:
+            skipped.append(f"{db_path.name}: {result.message}")
+
+    cleanup_backups(backup_dir, keep_days=keep_days, keep_count=keep_count)
+    return BackupAllResult(
+        found=len(db_paths),
+        created=len(created_paths),
+        paths=created_paths,
+        skipped=skipped,
+    )
 
 
 def cleanup_backups(backup_dir: str | Path, keep_days: int = 14, keep_count: int = 14) -> list[Path]:
