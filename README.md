@@ -247,6 +247,9 @@ TRAINING_TARGET_DRAFTS_PER_DAY=2
 Enable on VPS:
 
 ```bash
+sudo cp vps/headway-news-monitor-training7d.service /etc/systemd/system/
+sudo cp vps/headway-news-monitor-training7d.timer /etc/systemd/system/
+sudo chmod +x vps/run_training_monitor.sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now headway-news-monitor-training7d.timer
 sudo systemctl start headway-news-monitor-training7d.service
@@ -255,7 +258,7 @@ sudo systemctl start headway-news-monitor-training7d.service
 The service runs:
 
 ```bash
-/opt/headway-news-bot/.venv/bin/python /opt/headway-news-bot/monitor.py --hours "$TRAINING_LOOKBACK_HOURS" --send-review
+/opt/headway-news-bot/.venv/bin/python /opt/headway-news-bot/vps/monitor.py --hours "$TRAINING_LOOKBACK_HOURS" --send-review
 ```
 
 It does not call channel publishing code. Publishing still requires owner approval in Telegram.

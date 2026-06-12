@@ -46,7 +46,7 @@ RUNS=$((RUNS + 1))
 } >"$STATE_FILE"
 
 cd "$BASE_DIR"
-"$BASE_DIR/.venv/bin/python" "$BASE_DIR/monitor.py" --hours "$LOOKBACK_HOURS" --send-review
+"$BASE_DIR/.venv/bin/python" "$BASE_DIR/vps/monitor.py" --hours "$LOOKBACK_HOURS" --send-review
 
 NOW=$(date +%s)
 if [ "$NOW" -ge "$DEADLINE_AT" ]; then
