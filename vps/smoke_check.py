@@ -64,6 +64,8 @@ def main() -> int:
     monitor_py = read_text("monitor.py")
     service_py = read_first_existing("headway-news-monitor.service", "/etc/systemd/system/headway-news-monitor.service")
     china_service_py = read_first_existing("headway-china-daily-report.service", "/etc/systemd/system/headway-china-daily-report.service")
+    training_timer = read_first_existing("headway-news-monitor-training7d.timer", "/etc/systemd/system/headway-news-monitor-training7d.timer")
+    training_script = read_text("run_training_monitor.sh")
     history_py = read_text("database/history.py")
     rules_md = read_text("channel_agent_rules.md")
 
@@ -75,6 +77,8 @@ def main() -> int:
     check("record_draft_history(draft, aid)" in monitor_py, "Normal drafts are recorded with article id, not undefined version id", errors)
     check("--send-review" in service_py, "Main monitor service sends review/failure messages", errors)
     check("--send-review" in china_service_py, "China daily report sends review/failure messages", errors)
+    check("headway-news-monitor-training7d.service" in training_timer, "7-day training timer points at training service", errors)
+    check("TRAINING_TARGET_DRAFTS_PER_DAY" in training_script, "7-day training monitor keeps daily target setting", errors)
     check("get_recent_rejection_feedback" in history_py, "History DB exposes recent rejection feedback for prompt memory", errors)
     check("Do not write for marketers" in rules_md, "Channel rules keep posts away from marketer framing", errors)
     check("If the article is not actually about Russia" in rules_md, "Channel rules forbid fake Russia labeling", errors)

@@ -14,6 +14,9 @@ def test_env_example_contains_safe_stage_variables():
         "DAILY_REPORT_ENABLED=1",
         "DAILY_REPORT_TIME=09:00",
         "SCHEDULER_ENABLED=1",
+        "TRAINING_DURATION_HOURS=168",
+        "TRAINING_LOOKBACK_HOURS=24",
+        "TRAINING_TARGET_DRAFTS_PER_DAY=2",
     )
 
     for item in required:

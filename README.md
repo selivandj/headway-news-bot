@@ -204,6 +204,48 @@ systemctl restart headway-news-bot.service
 systemctl status headway-news-bot.service --no-pager
 ```
 
+## 7-day editorial training mode
+
+This temporary mode is used when the channel is being tuned again with owner feedback.
+It does not publish automatically. It only sends drafts to the owner for review.
+
+Goal for the training week:
+
+- collect enough candidates every day;
+- keep at least 2 strong publishable drafts per day in the review flow;
+- save owner comments, rejects, media notes, and publish decisions into `history.db`;
+- let future prompts use recent rejection feedback so provider swaps do not change the channel voice.
+
+Files:
+
+- `vps/headway-news-monitor-training7d.timer`
+- `vps/headway-news-monitor-training7d.service`
+- `vps/run_training_monitor.sh`
+
+Settings:
+
+```bash
+TRAINING_DURATION_HOURS=168
+TRAINING_LOOKBACK_HOURS=24
+TRAINING_TARGET_DRAFTS_PER_DAY=2
+```
+
+Enable on VPS:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now headway-news-monitor-training7d.timer
+sudo systemctl start headway-news-monitor-training7d.service
+```
+
+Stop manually:
+
+```bash
+sudo systemctl disable --now headway-news-monitor-training7d.timer
+```
+
+The timer disables itself after the configured duration.
+
 ## Safety
 
 Do not commit `.env`, API keys, Telegram tokens, SSH keys, runtime drafts, media storage, logs, or SQLite databases.

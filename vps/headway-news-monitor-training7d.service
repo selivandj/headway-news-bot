@@ -1,0 +1,13 @@
+[Unit]
+Description=Headway EV news monitor 7-day editorial training run
+After=network-online.target headway-news-bot.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/headway-news-bot
+ExecStart=/opt/headway-news-bot/run_training_monitor.sh
+Environment=PYTHONUNBUFFERED=1
+Environment=TRAINING_DURATION_HOURS=168
+Environment=TRAINING_LOOKBACK_HOURS=24
+Environment=TRAINING_TARGET_DRAFTS_PER_DAY=2

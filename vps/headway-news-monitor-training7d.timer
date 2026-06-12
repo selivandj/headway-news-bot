@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Headway EV news monitor hourly for 7-day editorial training
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=headway-news-monitor-training7d.service
+
+[Install]
+WantedBy=timers.target
