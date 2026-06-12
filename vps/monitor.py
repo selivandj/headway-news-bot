@@ -28,6 +28,8 @@ from openai import OpenAI
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ParseMode
 
+from keyboards import draft_action_keyboard as build_draft_action_keyboard
+
 try:
     from PIL import Image
 except Exception:
@@ -3326,23 +3328,8 @@ def save_review_mapping(draft_path: Path, messages) -> None:
         print(f"Could not save review mapping: {exc}")
 
 
-def draft_action_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Публиковать", callback_data="draft:publish"),
-                InlineKeyboardButton("🖼 Найти фото", callback_data="draft:find_photo"),
-            ],
-            [
-                InlineKeyboardButton("🎨 Сгенерировать", callback_data="draft:generate"),
-                InlineKeyboardButton("✏️ Переделать текст", callback_data="draft:rewrite"),
-            ],
-            [
-                InlineKeyboardButton("❌ Отклонить", callback_data="draft:reject"),
-                InlineKeyboardButton("ℹ️ Почему подходит?", callback_data="draft:why"),
-            ],
-        ]
-    )
+def draft_action_keyboard(draft_id: str | Path) -> InlineKeyboardMarkup:
+    return build_draft_action_keyboard(draft_id)
 
 
 
@@ -3718,7 +3705,7 @@ async def send_review(draft: dict, draft_path: Path | None = None) -> None:
         sent_messages.append(await bot.send_message(
             chat_id=REVIEW_CHAT_ID,
             text="Действия с черновиком:",
-            reply_markup=draft_action_keyboard(),
+            reply_markup=draft_action_keyboard(draft_path),
         ))
         save_review_mapping(draft_path, sent_messages)
 

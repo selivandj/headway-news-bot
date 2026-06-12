@@ -18,6 +18,16 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+from backup import create_sqlite_backup
+from keyboards import (
+    confirm_publish_keyboard,
+    draft_action_keyboard as build_draft_action_keyboard,
+    draft_callback_id,
+    reject_reason_keyboard,
+    reject_reason_label,
+)
+from security.rate_limit import RateLimiter
+
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -77,7 +87,16 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 REVIEW_CHAT_ID = int(os.environ["TELEGRAM_REVIEW_CHAT_ID"])
 CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 ADMIN_TELEGRAM_ID = int(os.environ.get("ADMIN_TELEGRAM_ID") or REVIEW_CHAT_ID)
+OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID") or ADMIN_TELEGRAM_ID or REVIEW_CHAT_ID)
 ERROR_NOTIFICATIONS_ENABLED = os.environ.get("ERROR_NOTIFICATIONS_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS") or "30")
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS") or "60")
+BACKUP_ENABLED = os.environ.get("BACKUP_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+BACKUP_KEEP_DAYS = int(os.environ.get("BACKUP_KEEP_DAYS") or "14")
+BACKUP_DIR = Path(os.environ.get("BACKUP_DIR") or (BASE_DIR / "backups"))
+if not BACKUP_DIR.is_absolute():
+    BACKUP_DIR = BASE_DIR / BACKUP_DIR
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or ""
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL") or None
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL") or "gpt-4.1-mini"
@@ -105,6 +124,11 @@ LLM_USAGE_LOG_PATH = LOG_DIR / "llm_usage.md"
 CHINA_DAILY_STATS_PATH = BASE_DIR / "china_monitor" / "logs" / "daily_stats.md"
 ERROR_TRACEBACK_CHARS = int(os.environ.get("ERROR_TRACEBACK_CHARS") or "2800")
 SCHEDULER = None
+COMMAND_RATE_LIMITER = RateLimiter(
+    requests=RATE_LIMIT_REQUESTS,
+    window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+    enabled=RATE_LIMIT_ENABLED,
+)
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +150,33 @@ def redact_secrets(value: str) -> str:
         if secret and len(secret) > 8:
             text = text.replace(secret, f"{secret[:4]}...{secret[-4:]}")
     return text
+
+
+def is_owner(update: Update) -> bool:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    user_id = update.effective_user.id if update.effective_user else None
+    return OWNER_CHAT_ID in {chat_id, user_id} or ADMIN_TELEGRAM_ID in {chat_id, user_id}
+
+
+async def require_owner(update: Update) -> bool:
+    if is_owner(update):
+        return True
+    target = update.callback_query.message if update.callback_query and update.callback_query.message else update.message
+    if target:
+        await target.reply_text("Команда доступна только владельцу.")
+    return False
+
+
+async def enforce_rate_limit(update: Update) -> bool:
+    user_id = update.effective_user.id if update.effective_user else None
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    key = str(user_id or chat_id or "unknown")
+    if COMMAND_RATE_LIMITER.allow(key):
+        return True
+    target = update.callback_query.message if update.callback_query and update.callback_query.message else update.message
+    if target:
+        await target.reply_text("Слишком много команд. Попробуйте позже.")
+    return False
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -232,6 +283,7 @@ def save_review_mapping(draft_path: Path, messages) -> None:
             mapping = {}
     for message in messages:
         mapping[str(message.message_id)] = draft_path.name
+    mapping[f"draft_id:{draft_callback_id(draft_path)}"] = draft_path.name
     REVIEW_MAP_PATH.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -248,23 +300,34 @@ def draft_from_message_id(message_id: int | str) -> Path | None:
     return mapped_pending_draft(filename)
 
 
-def draft_action_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Публиковать", callback_data="draft:publish"),
-                InlineKeyboardButton("🖼 Найти фото", callback_data="draft:find_photo"),
-            ],
-            [
-                InlineKeyboardButton("🎨 Сгенерировать", callback_data="draft:generate"),
-                InlineKeyboardButton("✏️ Переделать текст", callback_data="draft:rewrite"),
-            ],
-            [
-                InlineKeyboardButton("❌ Отклонить", callback_data="draft:reject"),
-                InlineKeyboardButton("ℹ️ Почему подходит?", callback_data="draft:why"),
-            ],
-        ]
+def draft_from_callback_id(callback_id: str | None) -> Path | None:
+    if not callback_id:
+        return None
+    if REVIEW_MAP_PATH.exists():
+        try:
+            mapping = json.loads(REVIEW_MAP_PATH.read_text(encoding="utf-8"))
+            filename = mapping.get(f"draft_id:{callback_id}")
+            if filename:
+                path = mapped_pending_draft(filename)
+                if path:
+                    return path
+        except Exception:
+            pass
+    matches = sorted(
+        DRAFT_DIR.glob(f"*-{callback_id}*.pending.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
     )
+    if matches:
+        return matches[0]
+    for draft_path in pending_drafts():
+        if draft_callback_id(draft_path) == callback_id:
+            return draft_path
+    return None
+
+
+def draft_action_keyboard(draft_id: str | Path | None = None) -> InlineKeyboardMarkup:
+    return build_draft_action_keyboard(draft_id or "draft")
 
 
 def append_owner_feedback(update: Update, draft_path: Path | None, text: str) -> None:
@@ -723,7 +786,7 @@ async def send_review_copy(update: Update, context: ContextTypes.DEFAULT_TYPE, d
         await context.bot.send_message(
             chat_id=REVIEW_CHAT_ID,
             text="Действия с черновиком:",
-            reply_markup=draft_action_keyboard(),
+            reply_markup=draft_action_keyboard(draft_path),
         )
     )
     save_review_mapping(draft_path, sent)
@@ -1084,7 +1147,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         sent.append(await context.bot.send_message(
             chat_id=REVIEW_CHAT_ID,
             text="Действия с черновиком:",
-            reply_markup=draft_action_keyboard(),
+            reply_markup=draft_action_keyboard(draft_path),
         ))
         save_review_mapping(draft_path, sent)
     except Exception as exc:
@@ -1236,7 +1299,23 @@ def build_daily_report_text() -> str:
 async def daily_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.id != REVIEW_CHAT_ID and update.effective_chat.id != ADMIN_TELEGRAM_ID:
         return
+    if not await enforce_rate_limit(update):
+        return
     await update.message.reply_text(build_daily_report_text(), disable_web_page_preview=True)
+
+
+async def backup_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != REVIEW_CHAT_ID and update.effective_chat.id != ADMIN_TELEGRAM_ID:
+        return
+    if not await require_owner(update):
+        return
+    if not await enforce_rate_limit(update):
+        return
+    result = create_sqlite_backup(DB_PATH, BACKUP_DIR, keep_days=BACKUP_KEEP_DAYS, keep_count=BACKUP_KEEP_DAYS)
+    if result.created:
+        await update.message.reply_text(f"Бэкап создан: {result.path}")
+    else:
+        await update.message.reply_text(f"Бэкап не создан: {result.message}")
 
 
 def is_stats_command_text(text: str) -> bool:
@@ -1507,7 +1586,7 @@ async def resend_draft_preview(bot, chat_id: int, draft: dict, draft_path: Path,
     sent.append(await bot.send_message(
         chat_id=chat_id,
         text="Действия с черновиком:",
-        reply_markup=draft_action_keyboard(),
+        reply_markup=draft_action_keyboard(draft_path),
     ))
     save_review_mapping(draft_path, sent)
 
@@ -1555,11 +1634,32 @@ async def find_photo_for_draft_from_button(query, context: ContextTypes.DEFAULT_
 
 def explain_draft_fit(draft: dict) -> str:
     media = draft.get("media") or []
+    text = " ".join(
+        str(draft.get(key) or "")
+        for key in ("headline", "title", "lead", "summary", "text", "source", "region")
+    ).lower()
+    keyword_groups = {
+        "зарядная инфраструктура": ["заряд", "charging", "charger", "evse", "эзс", "station"],
+        "быстрая зарядка": ["fast", "ultra", "dc", "мвт", "квт", "быстр", "ультра"],
+        "бизнес локации": ["магазин", "тц", "парков", "hub", "хаб", "fleet", "оператор", "сеть"],
+        "Китай / мировые практики": ["china", "byd", "nio", "xpeng", "li auto", "китай"],
+        "Россия / применимость": ["росси", "москв", "петербург", "минпромторг", "субсид"],
+    }
+    triggered = [
+        label
+        for label, markers in keyword_groups.items()
+        if any(marker in text for marker in markers)
+    ]
+    has_charging = "да" if any(label in triggered for label in ("зарядная инфраструктура", "быстрая зарядка")) else "не очевидно"
+    has_business = "да" if any(label in triggered for label in ("бизнес локации", "Россия / применимость")) else "частично"
     lines = [
         "Почему черновик подходит:",
         f"- Источник: {draft.get('source') or 'не указан'}",
         f"- Регион: {draft.get('region') or 'не указан'}",
         f"- Тема: {draft.get('headline') or draft.get('title') or 'не указана'}",
+        f"- Сработали темы: {', '.join(triggered[:5]) if triggered else 'явных маркеров мало'}",
+        f"- Зарядная инфраструктура: {has_charging}",
+        f"- Бизнес-смысл для аудитории: {has_business}",
         f"- Медиа: {'есть' if media else 'нет'}; статус: {draft.get('media_status') or 'not_checked'}",
     ]
     if draft.get("llm_provider"):
@@ -1580,20 +1680,51 @@ async def draft_button_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if query.message.chat_id != REVIEW_CHAT_ID:
         await query.answer()
         return
+    if not await require_owner(update):
+        await query.answer()
+        return
+    if not await enforce_rate_limit(update):
+        await query.answer()
+        return
     await query.answer()
-    action = (query.data or "").split(":", 1)[-1]
-    draft_path = draft_from_message_id(query.message.message_id)
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[0] if parts else ""
+    callback_id = parts[1] if len(parts) > 1 else ""
+    reason_code = parts[2] if len(parts) > 2 else ""
+
+    # Backward compatibility with buttons from the previous safe stage.
+    if action == "draft" and callback_id:
+        old_action = callback_id
+        action = {
+            "publish": "publish",
+            "find_photo": "find_photo",
+            "generate": "generate_image",
+            "rewrite": "rewrite",
+            "reject": "reject",
+            "why": "why",
+        }.get(old_action, old_action)
+        callback_id = ""
+
+    draft_path = draft_from_callback_id(callback_id) or draft_from_message_id(query.message.message_id)
     if not draft_path:
         await query.message.reply_text("Не нашел активный черновик для этой кнопки. Возможно, он уже опубликован, отменен или заменен новой версией.")
         return
 
     try:
         if action == "publish":
+            await query.message.reply_text(
+                "Опубликовать этот черновик?",
+                reply_markup=confirm_publish_keyboard(draft_path),
+            )
+        elif action == "confirm_publish":
             message = await publish_draft_to_channel(context.bot, draft_path, feedback="published_by_inline_button")
             await query.message.reply_text(message)
+        elif action == "cancel":
+            await query.message.reply_text("Ок, действие отменено.")
         elif action == "find_photo":
             await find_photo_for_draft_from_button(query, context, draft_path)
-        elif action == "generate":
+        elif action == "generate_image":
             draft = load_draft(draft_path)
             draft_id = record_history_created(draft, draft_path)
             if HISTORY_DB:
@@ -1612,13 +1743,24 @@ async def draft_button_callback(update: Update, context: ContextTypes.DEFAULT_TY
             start_rewrite(target)
             await query.message.reply_text("Принял: переделаю текст и пришлю новую версию на согласование.")
         elif action == "reject":
+            await query.message.reply_text(
+                "Выбери причину отклонения:",
+                reply_markup=reject_reason_keyboard(draft_path),
+            )
+        elif action == "reject_reason":
             draft = load_draft(draft_path)
             draft_id = record_history_created(draft, draft_path)
+            reason = reject_reason_label(reason_code)
+            draft["reject_reason"] = reason
+            draft["status"] = "rejected"
+            draft_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8")
             target = CANCELLED_DIR / draft_path.name.replace(".pending.json", ".cancelled.json")
             draft_path.rename(target)
             if HISTORY_DB:
-                HISTORY_DB.record_draft_rejected(draft_id, reason="inline_reject", draft_data=history_payload(draft, target))
-            await query.message.reply_text("Черновик отклонен и снят с публикации.")
+                HISTORY_DB.record_draft_rejected(draft_id, reason=reason, draft_data=history_payload(draft, target))
+                if reason_code == "bad_media":
+                    HISTORY_DB.record_bad_media(draft_id, reason)
+            await query.message.reply_text(f"Черновик отклонен. Причина: {reason}")
         elif action == "why":
             await query.message.reply_text(explain_draft_fit(load_draft(draft_path)), disable_web_page_preview=True)
     except Exception as exc:
@@ -1676,6 +1818,19 @@ async def scheduled_source_health_check(application: Application) -> None:
         logging.exception("Could not run source health check")
 
 
+async def scheduled_history_backup(application: Application) -> None:
+    if not BACKUP_ENABLED:
+        return
+    try:
+        result = create_sqlite_backup(DB_PATH, BACKUP_DIR, keep_days=BACKUP_KEEP_DAYS, keep_count=BACKUP_KEEP_DAYS)
+        if result.created:
+            logging.info("Scheduled history backup created: %s", result.path)
+        else:
+            logging.info("Scheduled history backup skipped: %s", result.message)
+    except Exception:
+        logging.exception("Scheduled history backup failed")
+
+
 def start_scheduler(application: Application) -> None:
     global SCHEDULER
     if not SCHEDULER_ENABLED:
@@ -1706,6 +1861,15 @@ def start_scheduler(application: Application) -> None:
         coalesce=True,
         max_instances=1,
     )
+    SCHEDULER.add_job(
+        scheduled_history_backup,
+        CronTrigger(hour=3, minute=20, timezone=scheduler_timezone()),
+        args=[application],
+        id="headway_history_backup",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
     SCHEDULER.start()
     logging.info("APScheduler started: daily report at %02d:%02d %s", hour, minute, SCHEDULER_TIMEZONE)
 
@@ -1724,6 +1888,8 @@ async def post_shutdown(application: Application) -> None:
 async def publish_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.id != REVIEW_CHAT_ID:
         return
+    if not await enforce_rate_limit(update):
+        return
 
     incoming = (update.message.text or "").strip().lower()
     if is_stats_command_text(update.message.text or ""):
@@ -1733,6 +1899,8 @@ async def publish_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update_editorial_memory(update)
         return
     if incoming == "отмена":
+        if not await require_owner(update):
+            return
         await cancel_latest(update, context)
         return
 
@@ -1745,6 +1913,8 @@ async def publish_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             or is_rewrite_feedback(update.message.text)
             or is_reject_feedback(update.message.text)
         )
+        if action_requires_reply and not await require_owner(update):
+            return
         draft_path = selected_reply_draft(update)
         if action_requires_reply and not draft_path:
             reply = update.message.reply_to_message if update.message else None
@@ -1825,6 +1995,8 @@ async def publish_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text("Запомнил обратную связь для следующих постов. Черновик не опубликован.")
         return
 
+    if not await require_owner(update):
+        return
     draft_path = selected_reply_draft(update)
     if not draft_path:
         await update.message.reply_text("Для публикации ответь «публикуй» именно на нужный черновик.")
@@ -1909,9 +2081,15 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("daily_report", daily_report_command))
+    app.add_handler(CommandHandler("backup_now", backup_now_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("update_memory", memory_command))
-    app.add_handler(CallbackQueryHandler(draft_button_callback, pattern=r"^draft:"))
+    app.add_handler(
+        CallbackQueryHandler(
+            draft_button_callback,
+            pattern=r"^(draft:|publish:|confirm_publish:|find_photo:|generate_image:|rewrite:|reject:|reject_reason:|why:|cancel:)",
+        )
+    )
     app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, publish_latest))
     app.add_error_handler(error_handler)

@@ -1,0 +1,25 @@
+{
+  "title": "Headway Bot Statistics",
+  "description": "Local-only SQLite viewer for Headway Telegram Bot history. Bind Datasette to 127.0.0.1 and access it through an SSH tunnel.",
+  "databases": {
+    "history": {
+      "tables": {
+        "drafts": {
+          "description": "Draft lifecycle, source quality and media status."
+        },
+        "owner_feedback": {
+          "description": "Owner decisions and rejection reasons."
+        },
+        "sources": {
+          "description": "Aggregated source quality statistics."
+        },
+        "providers": {
+          "description": "LLM provider success statistics."
+        },
+        "topics": {
+          "description": "Topic approval statistics."
+        }
+      }
+    }
+  }
+}

@@ -17,6 +17,7 @@ vps/media/voice/
 vps/china_monitor/logs/
 vps/database/*.db
 vps/database/*.db-*
+vps/backups/
 vps/review_map.json
 
 # Local analysis/output artifacts

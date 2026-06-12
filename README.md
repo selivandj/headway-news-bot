@@ -20,6 +20,11 @@ The project searches EV charging news, creates Russian Telegram drafts, attaches
 - `vps/database/history.py` - SQLite history, quality statistics, owner feedback memory.
 - `vps/media/precise_image_search.py` - precise image search for draft media corrections.
 - `vps/media/media_status.py` - media status messages and owner guidance.
+- `vps/keyboards.py` - inline keyboards with draft-bound callback data.
+- `vps/media/image_dedup.py` - ImageHash-based media duplicate detection.
+- `vps/backup.py` - SQLite gzip backups.
+- `vps/security/rate_limit.py` - simple in-memory command rate limiter.
+- `vps/datasette-metadata.json` - local-only Datasette metadata.
 - `vps/smoke_check.py` - fast deployment sanity check.
 - `vps/tests/test_static_guards.py` - static guard tests for critical behavior.
 
@@ -86,6 +91,117 @@ Root smoke-тесты лежат в `tests/` и не требуют реальн
 
 ```bash
 python -m pytest tests
+```
+
+## Этап 2: управление черновиками и защита медиа
+
+### Inline-кнопки черновиков
+
+Клавиатуры вынесены в `vps/keyboards.py`. Каждая кнопка содержит короткий `draft_id`, поэтому действие привязано к конкретному черновику:
+
+- `publish:{draft_id}` - сначала показывает подтверждение публикации.
+- `confirm_publish:{draft_id}` - публикует после второго клика владельца.
+- `find_photo:{draft_id}` - запускает точный поиск фото.
+- `generate_image:{draft_id}` - запускает генерацию только по явной команде владельца.
+- `rewrite:{draft_id}` - отправляет черновик на переписывание.
+- `reject:{draft_id}` - показывает причины отклонения.
+- `reject_reason:{draft_id}:{reason}` - сохраняет причину и снимает черновик.
+- `why:{draft_id}` - объясняет релевантность новости.
+
+Старые текстовые команды не удалены.
+
+### ImageHash и защита от дублей
+
+`vps/media/image_dedup.py` считает perceptual hash изображения и хранит его в `vps/database/image_hashes.db`.
+
+Настройки:
+
+```bash
+IMAGE_HASH_ENABLED=1
+IMAGE_HASH_THRESHOLD=10
+```
+
+Точный поиск фото через `vps/media/precise_image_search.py` проверяет найденное изображение через ImageHash. Если фото похоже на уже использованное, бот не подставляет его автоматически и пишет это в лог.
+
+### Просмотр статистики через Datasette
+
+Это не веб-админка, а локальный просмотр SQLite. Порт наружу не открывать.
+
+```bash
+pip install datasette
+datasette vps/database/history.db \
+  --host=127.0.0.1 \
+  --port=8001 \
+  --metadata=vps/datasette-metadata.json
+```
+
+Доступ с компьютера:
+
+```bash
+ssh -L 8001:localhost:8001 root@VPS_IP
+```
+
+Потом открыть `http://127.0.0.1:8001`. Пример systemd unit: `deploy/headway-datasette.service.example`.
+
+### Автобэкап базы
+
+`vps/backup.py` делает gzip-бэкап SQLite и хранит последние архивы.
+
+Настройки:
+
+```bash
+BACKUP_ENABLED=1
+BACKUP_KEEP_DAYS=14
+BACKUP_DIR=backups
+```
+
+Ручной запуск в Telegram:
+
+```text
+/backup_now
+```
+
+Команда доступна только владельцу. Если базы еще нет, бот не падает и отвечает, что бэкап не создан.
+
+### Owner-only команды
+
+Критичные действия проверяют владельца:
+
+- публикация;
+- отклонение;
+- генерация изображения;
+- поиск изображения;
+- бэкап.
+
+Настройки:
+
+```bash
+OWNER_CHAT_ID=117574226
+ADMIN_TELEGRAM_ID=117574226
+```
+
+Если команду вызывает не владелец, бот отвечает: `Команда доступна только владельцу.`
+
+### Rate limit
+
+Простой in-memory limiter без Redis:
+
+```bash
+RATE_LIMIT_ENABLED=1
+RATE_LIMIT_REQUESTS=30
+RATE_LIMIT_WINDOW_SECONDS=60
+```
+
+При превышении лимита бот отвечает: `Слишком много команд. Попробуйте позже.`
+
+### Проверка после деплоя
+
+```bash
+python -m compileall vps
+python -m pytest tests -v
+python vps/smoke_check.py
+systemctl restart headway-news-bot.service
+systemctl status headway-news-bot.service --no-pager
 ```
 
 ## Safety

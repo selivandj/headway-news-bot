@@ -47,11 +47,15 @@ def main() -> int:
         "bot.py",
         "monitor.py",
         "database/history.py",
+        "keyboards.py",
+        "backup.py",
         "media/media_status.py",
+        "media/image_dedup.py",
         "media/precise_image_search.py",
         "parsers/china_sources.py",
         "parsers/sogou_image_search.py",
         "search/cache.py",
+        "security/rate_limit.py",
         "tests/test_static_guards.py",
     ):
         compile_file(relative_path, errors)
@@ -64,6 +68,8 @@ def main() -> int:
     rules_md = read_text("channel_agent_rules.md")
 
     check("app.add_error_handler(error_handler)" in bot_py, "Telegram bot has owner-visible error handler", errors)
+    check("backup_now_command" in bot_py, "Telegram bot has owner-only backup command", errors)
+    check("confirm_publish_keyboard" in bot_py, "Inline publish path asks for confirmation", errors)
     check("notify_monitor_failure" in monitor_py, "Monitor reports fatal failures to review chat", errors)
     check("collect_china_candidates(24, force=True)" in monitor_py, "China daily report refreshes sources before reporting", errors)
     check("record_draft_history(draft, aid)" in monitor_py, "Normal drafts are recorded with article id, not undefined version id", errors)

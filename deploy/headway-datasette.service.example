@@ -1,0 +1,13 @@
+[Unit]
+Description=Headway Datasette local SQLite viewer
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/headway-news-bot
+ExecStart=/opt/headway-news-bot/.venv/bin/datasette /opt/headway-news-bot/database/history.db --host 127.0.0.1 --port 8001 --metadata /opt/headway-news-bot/datasette-metadata.json
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
