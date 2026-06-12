@@ -1,0 +1,10 @@
+[Unit]
+Description=Send Headway China parser evening report
+
+[Timer]
+OnCalendar=*-*-* 15:00:00
+Persistent=true
+Unit=headway-china-daily-report.service
+
+[Install]
+WantedBy=timers.target

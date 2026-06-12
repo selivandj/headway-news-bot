@@ -1,0 +1,42 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+ssh/
+
+# Runtime data
+vps/drafts/
+vps/published/
+vps/cancelled/
+vps/feedback/
+vps/logs/
+vps/media/storage/
+vps/media/voice/
+vps/china_monitor/logs/
+vps/database/*.db
+vps/database/*.db-*
+vps/review_map.json
+
+# Local analysis/output artifacts
+analysis_artifacts/
+media/
+pending-*.html
+tg-post-example.html
+telegram-publish.ps1
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

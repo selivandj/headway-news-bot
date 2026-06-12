@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Headway China proxy/parser test every 6 hours
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=headway-china-test.service
+
+[Install]
+WantedBy=timers.target

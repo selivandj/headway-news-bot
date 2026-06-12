@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Headway EV news monitor three times per day
+
+[Timer]
+OnCalendar=*-*-* 04,09,14:00:00
+Persistent=true
+Unit=headway-news-monitor.service
+
+[Install]
+WantedBy=timers.target

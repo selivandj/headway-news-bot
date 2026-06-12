@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Headway EV news monitor hourly for 24 hours
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=headway-news-monitor-hourly24.service
+
+[Install]
+WantedBy=timers.target

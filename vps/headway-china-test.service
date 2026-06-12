@@ -1,0 +1,10 @@
+[Unit]
+Description=Headway China proxy/parser 48h test run
+After=network-online.target headway-news-bot.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/headway-news-bot
+ExecStart=/opt/headway-news-bot/.venv/bin/python /opt/headway-news-bot/monitor.py --china-test-run --hours 48 --test-duration-hours 48 --send-review
+Environment=PYTHONUNBUFFERED=1

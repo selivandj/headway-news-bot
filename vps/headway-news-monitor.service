@@ -1,0 +1,10 @@
+[Unit]
+Description=Headway EV news monitor
+After=network-online.target headway-news-bot.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/headway-news-bot
+ExecStart=/opt/headway-news-bot/.venv/bin/python /opt/headway-news-bot/monitor.py --hours 8 --send-review
+Environment=PYTHONUNBUFFERED=1

@@ -1,0 +1,15 @@
+[Unit]
+Description=Headway Telegram approval bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/headway-news-bot
+ExecStart=/opt/headway-news-bot/.venv/bin/python /opt/headway-news-bot/bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
