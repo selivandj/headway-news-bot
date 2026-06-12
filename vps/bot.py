@@ -4,16 +4,26 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import textwrap
 import time
 import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import InputMediaPhoto, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+except Exception:
+    AsyncIOScheduler = None
+    CronTrigger = None
 
 try:
     from openai import OpenAI
@@ -66,6 +76,8 @@ load_dotenv(BASE_DIR / ".env")
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 REVIEW_CHAT_ID = int(os.environ["TELEGRAM_REVIEW_CHAT_ID"])
 CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
+ADMIN_TELEGRAM_ID = int(os.environ.get("ADMIN_TELEGRAM_ID") or REVIEW_CHAT_ID)
+ERROR_NOTIFICATIONS_ENABLED = os.environ.get("ERROR_NOTIFICATIONS_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or ""
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL") or None
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL") or "gpt-4.1-mini"
@@ -84,9 +96,15 @@ GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL") or "https://api.groq.com/openai/
 GROQ_MODEL = os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile"
 LLM_PROVIDER_CHAIN = os.environ.get("LLM_PROVIDER_CHAIN") or ""
 LLM_PROVIDER = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
+DAILY_REPORT_ENABLED = os.environ.get("DAILY_REPORT_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+DAILY_REPORT_TIME = os.environ.get("DAILY_REPORT_TIME") or "09:00"
+SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+SCHEDULER_TIMEZONE = os.environ.get("SCHEDULER_TIMEZONE") or "Asia/Yekaterinburg"
 LOG_DIR = BASE_DIR / "logs"
 LLM_USAGE_LOG_PATH = LOG_DIR / "llm_usage.md"
+CHINA_DAILY_STATS_PATH = BASE_DIR / "china_monitor" / "logs" / "daily_stats.md"
 ERROR_TRACEBACK_CHARS = int(os.environ.get("ERROR_TRACEBACK_CHARS") or "2800")
+SCHEDULER = None
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -114,26 +132,30 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     """Notify the owner when the polling bot hits an unhandled exception."""
     error = context.error
     logging.exception("Unhandled Telegram bot error", exc_info=error)
-    if not REVIEW_CHAT_ID:
+    if not ERROR_NOTIFICATIONS_ENABLED or not ADMIN_TELEGRAM_ID:
         return
 
     error_name = type(error).__name__ if error else "UnknownError"
     error_text = redact_secrets(str(error) if error else "")
+    module_name = getattr(getattr(error, "__traceback__", None), "tb_frame", None)
+    module_name = module_name.f_globals.get("__name__", "bot") if module_name else "bot"
+    now_text = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     trace = ""
     if error:
         trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
         trace = redact_secrets(trace)[-ERROR_TRACEBACK_CHARS:]
 
     message = (
-        "Сбой в Telegram-боте Headway.\n"
-        f"Тип: {error_name}\n"
-        f"Ошибка: {error_text[:700] or 'без текста'}\n\n"
-        "Публикация не выполнялась автоматически. Подробности сохранены в журнале VPS."
+        "⚠️ Ошибка Headway Bot\n"
+        f"Модуль: {module_name}\n"
+        f"Ошибка: {error_name}: {error_text[:700] or 'без текста'}\n"
+        f"Время: {now_text}\n"
+        "Бот продолжил работу / требуется проверка."
     )
     if trace:
         message += f"\n\nКороткий хвост ошибки:\n{trace}"
     try:
-        await context.bot.send_message(chat_id=REVIEW_CHAT_ID, text=message[:4096])
+        await context.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message[:4096])
     except Exception:
         logging.exception("Could not notify owner about Telegram bot error")
 
@@ -211,6 +233,38 @@ def save_review_mapping(draft_path: Path, messages) -> None:
     for message in messages:
         mapping[str(message.message_id)] = draft_path.name
     REVIEW_MAP_PATH.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def draft_from_message_id(message_id: int | str) -> Path | None:
+    if not REVIEW_MAP_PATH.exists():
+        return None
+    try:
+        mapping = json.loads(REVIEW_MAP_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    filename = mapping.get(str(message_id))
+    if not filename:
+        return None
+    return mapped_pending_draft(filename)
+
+
+def draft_action_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Публиковать", callback_data="draft:publish"),
+                InlineKeyboardButton("🖼 Найти фото", callback_data="draft:find_photo"),
+            ],
+            [
+                InlineKeyboardButton("🎨 Сгенерировать", callback_data="draft:generate"),
+                InlineKeyboardButton("✏️ Переделать текст", callback_data="draft:rewrite"),
+            ],
+            [
+                InlineKeyboardButton("❌ Отклонить", callback_data="draft:reject"),
+                InlineKeyboardButton("ℹ️ Почему подходит?", callback_data="draft:why"),
+            ],
+        ]
+    )
 
 
 def append_owner_feedback(update: Update, draft_path: Path | None, text: str) -> None:
@@ -665,6 +719,13 @@ async def send_review_copy(update: Update, context: ContextTypes.DEFAULT_TYPE, d
             text="Это обновленный черновик с найденными фото. Если ок, ответь на этот черновик: публикуй",
         )
     )
+    sent.append(
+        await context.bot.send_message(
+            chat_id=REVIEW_CHAT_ID,
+            text="Действия с черновиком:",
+            reply_markup=draft_action_keyboard(),
+        )
+    )
     save_review_mapping(draft_path, sent)
     record_history_created(draft, draft_path)
 
@@ -1020,6 +1081,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             chat_id=REVIEW_CHAT_ID,
             text="Это черновик из голосовой идеи. Если ок, ответь на этот черновик: публикуй",
         ))
+        sent.append(await context.bot.send_message(
+            chat_id=REVIEW_CHAT_ID,
+            text="Действия с черновиком:",
+            reply_markup=draft_action_keyboard(),
+        ))
         save_review_mapping(draft_path, sent)
     except Exception as exc:
         logging.exception("Voice draft failed")
@@ -1058,6 +1124,119 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append("")
     lines.append("Для публикации ответь «публикуй» именно на нужный черновик.")
     await update.message.reply_text("\n".join(lines))
+
+
+def _safe_json_list(value: str | None) -> list:
+    if not value:
+        return []
+    try:
+        data = json.loads(value)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _daily_source_error_count(cutoff: datetime) -> int:
+    if not CHINA_DAILY_STATS_PATH.exists():
+        return 0
+    count = 0
+    for line in CHINA_DAILY_STATS_PATH.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line.startswith("| 20"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) < 5:
+            continue
+        try:
+            row_time = datetime.strptime(cells[0].replace(" UTC", ""), "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if row_time < cutoff.astimezone(timezone.utc):
+            continue
+        errors = cells[4]
+        if errors and errors != "-":
+            count += len([item for item in errors.split(";") if item.strip()])
+    return count
+
+
+def build_daily_report_text() -> str:
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=24)
+    cutoff_ts = int(cutoff_dt.timestamp())
+    cutoff_iso = cutoff_dt.isoformat()
+
+    if not DB_PATH.exists():
+        return "Статистика за сутки пока не накоплена."
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        article_rows = []
+        draft_rows = []
+        if "articles" in tables:
+            article_rows = conn.execute(
+                "SELECT source, status FROM articles WHERE created_at >= ?",
+                (cutoff_ts,),
+            ).fetchall()
+        if "drafts" in tables:
+            draft_rows = conn.execute(
+                "SELECT source, status, topic_tags FROM drafts WHERE created_at >= ?",
+                (cutoff_iso,),
+            ).fetchall()
+
+    if not article_rows and not draft_rows:
+        return "Статистика за сутки пока не накоплена."
+
+    checked_sources = {str(row["source"] or "unknown") for row in article_rows}
+    checked_sources.update(str(row["source"] or "unknown") for row in draft_rows)
+    news_found = len(article_rows)
+    passed_filter = len([row for row in article_rows if row["status"] in {"drafted", "published"}])
+    drafts_created = len(draft_rows)
+    rejected = len([row for row in draft_rows if row["status"] in {"rejected", "cancelled"}])
+    rejected += len([row for row in article_rows if row["status"] == "rejected"])
+    source_errors = _daily_source_error_count(cutoff_dt)
+
+    source_counts: dict[str, int] = {}
+    for row in article_rows:
+        source = str(row["source"] or "unknown")
+        source_counts[source] = source_counts.get(source, 0) + 1
+    for row in draft_rows:
+        source = str(row["source"] or "unknown")
+        source_counts.setdefault(source, 0)
+
+    topic_counts: dict[str, int] = {}
+    for row in draft_rows:
+        for tag in _safe_json_list(row["topic_tags"]):
+            topic = str(tag or "").strip()
+            if topic:
+                topic_counts[topic] = topic_counts.get(topic, 0) + 1
+
+    lines = [
+        "📊 Daily report Headway Bot за 24 часа",
+        "",
+        f"Источников проверено: {len(checked_sources)}",
+        f"Новостей найдено: {news_found}",
+        f"Прошло фильтр: {max(passed_filter, drafts_created)}",
+        f"Черновиков создано: {drafts_created}",
+        f"Отклонено/снято: {rejected}",
+        f"Ошибок источников: {source_errors}",
+    ]
+    if source_counts:
+        lines.extend(["", "Топ источников:"])
+        for source, count in sorted(source_counts.items(), key=lambda item: item[1], reverse=True)[:5]:
+            lines.append(f"- {source}: {count}")
+    if topic_counts:
+        lines.extend(["", "Топ тем дня:"])
+        for topic, count in sorted(topic_counts.items(), key=lambda item: item[1], reverse=True)[:5]:
+            lines.append(f"- {topic}: {count}")
+    return "\n".join(lines)
+
+
+async def daily_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != REVIEW_CHAT_ID and update.effective_chat.id != ADMIN_TELEGRAM_ID:
+        return
+    await update.message.reply_text(build_daily_report_text(), disable_web_page_preview=True)
 
 
 def is_stats_command_text(text: str) -> bool:
@@ -1240,6 +1419,308 @@ async def cancel_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("Черновик отменен.")
 
 
+async def publish_draft_to_channel(bot, draft_path: Path, feedback: str = "published_by_owner") -> str:
+    draft = load_draft(draft_path)
+    draft_history_id = record_history_created(draft, draft_path)
+    post_text = draft.get("text", "").strip()
+    media = draft.get("media", [])
+    if not post_text:
+        raise ValueError("Draft has no post text")
+
+    published_text_as_caption = False
+    opened = []
+    try:
+        if media and post_text and len(post_text) <= 1024:
+            photos = []
+            for index, item in enumerate(media[:10]):
+                media_path = BASE_DIR / item["path"]
+                handle = media_path.open("rb")
+                opened.append(handle)
+                if index == 0:
+                    photos.append(InputMediaPhoto(media=handle, caption=post_text, parse_mode=ParseMode.HTML))
+                else:
+                    photos.append(InputMediaPhoto(media=handle))
+            await bot.send_media_group(chat_id=CHANNEL_ID, media=photos)
+            published_text_as_caption = True
+        elif media:
+            photos = []
+            for item in media[:10]:
+                media_path = BASE_DIR / item["path"]
+                handle = media_path.open("rb")
+                opened.append(handle)
+                photos.append(InputMediaPhoto(media=handle))
+            await bot.send_media_group(chat_id=CHANNEL_ID, media=photos)
+
+        if post_text and not published_text_as_caption:
+            await bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=post_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+    finally:
+        for handle in opened:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+    target = PUBLISHED_DIR / draft_path.name.replace(".pending.json", ".published.json")
+    draft_path.rename(target)
+    if HISTORY_DB:
+        try:
+            HISTORY_DB.record_draft_approved(draft_history_id, feedback=feedback, draft_data=history_payload(draft, target))
+            if media:
+                HISTORY_DB.update_media_status(draft_history_id, draft.get("media_status") or "published_with_media", has_media=True, draft_data=history_payload(draft, target))
+        except Exception:
+            logging.exception("Could not record publication in history")
+    return "Опубликовано в канал."
+
+
+async def resend_draft_preview(bot, chat_id: int, draft: dict, draft_path: Path, note: str = "") -> None:
+    sent = []
+    if note:
+        sent.append(await bot.send_message(chat_id=chat_id, text=note))
+    media = draft.get("media") or []
+    if media:
+        photos = []
+        opened = []
+        try:
+            for item in media[:10]:
+                handle = (BASE_DIR / item["path"]).open("rb")
+                opened.append(handle)
+                photos.append(InputMediaPhoto(media=handle))
+            sent.extend(await bot.send_media_group(chat_id=chat_id, media=photos))
+        finally:
+            for handle in opened:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+    if draft.get("text"):
+        sent.append(await bot.send_message(
+            chat_id=chat_id,
+            text=draft["text"],
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        ))
+    sent.append(await bot.send_message(
+        chat_id=chat_id,
+        text="Действия с черновиком:",
+        reply_markup=draft_action_keyboard(),
+    ))
+    save_review_mapping(draft_path, sent)
+
+
+async def find_photo_for_draft_from_button(query, context: ContextTypes.DEFAULT_TYPE, draft_path: Path) -> None:
+    if IMAGE_SEARCHER is None:
+        await query.message.reply_text("Поиск фото сейчас недоступен: модуль поиска не загрузился.")
+        return
+    draft = load_draft(draft_path)
+    draft_history_id = record_history_created(draft, draft_path)
+    entities = extract_entities_from_draft(draft)
+    if not entities:
+        await query.message.reply_text("Не удалось выделить точную сущность для поиска. Ответь текстом: найди фото [модель/компания].")
+        return
+
+    await query.message.reply_text(f"Ищу фото по сущностям: {', '.join(entities[:2])}")
+    result = await asyncio.to_thread(IMAGE_SEARCHER.search_by_entities, entities, article_id_for_draft(draft, draft_path), 2)
+    media = draft_media_from_precise_result(result)
+    draft["media_search_attempts"] = int(draft.get("media_search_attempts") or 0) + 1
+
+    if not media:
+        draft["media_status"] = "not_found"
+        draft_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8")
+        if HISTORY_DB:
+            try:
+                HISTORY_DB.update_media_status(draft_history_id, "not_found", has_media=False, draft_data=history_payload(draft, draft_path))
+                HISTORY_DB.record_feedback(draft_history_id, "media_not_found_by_button", "inline_find_photo", history_payload(draft, draft_path))
+            except Exception:
+                logging.exception("Could not record missing media from inline button")
+        await query.message.reply_text("Точное фото не найдено. Можно ответить текстом: найди фото [конкретная модель], или нажать генерацию.")
+        return
+
+    draft["media"] = media
+    draft["media_status"] = "found_by_inline_search"
+    draft["needs_media"] = False
+    draft_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8")
+    if HISTORY_DB:
+        try:
+            HISTORY_DB.update_media_status(draft_history_id, "found_by_inline_search", has_media=True, draft_data=history_payload(draft, draft_path))
+            HISTORY_DB.record_feedback(draft_history_id, "media_found_by_button", "inline_find_photo", history_payload(draft, draft_path))
+        except Exception:
+            logging.exception("Could not record inline media search")
+    await resend_draft_preview(context.bot, query.message.chat_id, draft, draft_path, note="Нашел фото и обновил черновик.")
+
+
+def explain_draft_fit(draft: dict) -> str:
+    media = draft.get("media") or []
+    lines = [
+        "Почему черновик подходит:",
+        f"- Источник: {draft.get('source') or 'не указан'}",
+        f"- Регион: {draft.get('region') or 'не указан'}",
+        f"- Тема: {draft.get('headline') or draft.get('title') or 'не указана'}",
+        f"- Медиа: {'есть' if media else 'нет'}; статус: {draft.get('media_status') or 'not_checked'}",
+    ]
+    if draft.get("llm_provider"):
+        lines.append(f"- Модель/провайдер: {draft.get('llm_provider')} {draft.get('llm_model') or ''}".strip())
+    if draft.get("selection_note"):
+        lines.append(f"- Отбор: {draft.get('selection_note')}")
+    if draft.get("link"):
+        lines.append(f"- Оригинал: {draft.get('link')}")
+    lines.append("")
+    lines.append("Публикация все равно только после явного подтверждения владельца.")
+    return "\n".join(lines)
+
+
+async def draft_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    if query.message.chat_id != REVIEW_CHAT_ID:
+        await query.answer()
+        return
+    await query.answer()
+    action = (query.data or "").split(":", 1)[-1]
+    draft_path = draft_from_message_id(query.message.message_id)
+    if not draft_path:
+        await query.message.reply_text("Не нашел активный черновик для этой кнопки. Возможно, он уже опубликован, отменен или заменен новой версией.")
+        return
+
+    try:
+        if action == "publish":
+            message = await publish_draft_to_channel(context.bot, draft_path, feedback="published_by_inline_button")
+            await query.message.reply_text(message)
+        elif action == "find_photo":
+            await find_photo_for_draft_from_button(query, context, draft_path)
+        elif action == "generate":
+            draft = load_draft(draft_path)
+            draft_id = record_history_created(draft, draft_path)
+            if HISTORY_DB:
+                HISTORY_DB.record_feedback(draft_id, "generate_media_requested", "inline_generate", history_payload(draft, draft_path))
+            target = CANCELLED_DIR / draft_path.name.replace(".pending.json", ".generate-source.json")
+            draft_path.rename(target)
+            start_generated_image(target)
+            await query.message.reply_text("Принял: сгенерирую нейтральную иллюстрацию и пришлю новый черновик на согласование.")
+        elif action == "rewrite":
+            draft = load_draft(draft_path)
+            draft_id = record_history_created(draft, draft_path)
+            if HISTORY_DB:
+                HISTORY_DB.record_feedback(draft_id, "rewrite_requested", "inline_rewrite", history_payload(draft, draft_path))
+            target = CANCELLED_DIR / draft_path.name.replace(".pending.json", ".rewrite-source.json")
+            draft_path.rename(target)
+            start_rewrite(target)
+            await query.message.reply_text("Принял: переделаю текст и пришлю новую версию на согласование.")
+        elif action == "reject":
+            draft = load_draft(draft_path)
+            draft_id = record_history_created(draft, draft_path)
+            target = CANCELLED_DIR / draft_path.name.replace(".pending.json", ".cancelled.json")
+            draft_path.rename(target)
+            if HISTORY_DB:
+                HISTORY_DB.record_draft_rejected(draft_id, reason="inline_reject", draft_data=history_payload(draft, target))
+            await query.message.reply_text("Черновик отклонен и снят с публикации.")
+        elif action == "why":
+            await query.message.reply_text(explain_draft_fit(load_draft(draft_path)), disable_web_page_preview=True)
+    except Exception as exc:
+        logging.exception("Inline draft action failed")
+        await query.message.reply_text(f"Не смог выполнить действие: {redact_secrets(str(exc))[:700]}")
+
+
+def parse_daily_report_time(value: str) -> tuple[int, int]:
+    match = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", value or "")
+    if not match:
+        return 9, 0
+    hour = max(0, min(23, int(match.group(1))))
+    minute = max(0, min(59, int(match.group(2))))
+    return hour, minute
+
+
+def scheduler_timezone():
+    try:
+        return ZoneInfo(SCHEDULER_TIMEZONE)
+    except Exception:
+        return timezone.utc
+
+
+async def scheduled_daily_report(application: Application) -> None:
+    if not DAILY_REPORT_ENABLED:
+        return
+    try:
+        await application.bot.send_message(
+            chat_id=ADMIN_TELEGRAM_ID,
+            text=build_daily_report_text(),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logging.exception("Could not send scheduled daily report")
+
+
+async def run_optional_source_health_check() -> None:
+    health_script = BASE_DIR / "source_health_check.py"
+    if not health_script.exists():
+        return
+    python_path = BASE_DIR / ".venv" / "bin" / "python"
+    subprocess.Popen(
+        [str(python_path), str(health_script)],
+        cwd=BASE_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+async def scheduled_source_health_check(application: Application) -> None:
+    try:
+        await run_optional_source_health_check()
+    except Exception:
+        logging.exception("Could not run source health check")
+
+
+def start_scheduler(application: Application) -> None:
+    global SCHEDULER
+    if not SCHEDULER_ENABLED:
+        return
+    if AsyncIOScheduler is None or CronTrigger is None:
+        logging.warning("APScheduler is not installed; scheduled jobs are disabled")
+        return
+    if SCHEDULER and SCHEDULER.running:
+        return
+
+    hour, minute = parse_daily_report_time(DAILY_REPORT_TIME)
+    SCHEDULER = AsyncIOScheduler(timezone=scheduler_timezone())
+    SCHEDULER.add_job(
+        scheduled_daily_report,
+        CronTrigger(hour=hour, minute=minute, timezone=scheduler_timezone()),
+        args=[application],
+        id="headway_daily_report",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    SCHEDULER.add_job(
+        scheduled_source_health_check,
+        CronTrigger(hour="*/6", minute=10, timezone=scheduler_timezone()),
+        args=[application],
+        id="headway_source_health_check",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    SCHEDULER.start()
+    logging.info("APScheduler started: daily report at %02d:%02d %s", hour, minute, SCHEDULER_TIMEZONE)
+
+
+async def post_init(application: Application) -> None:
+    start_scheduler(application)
+
+
+async def post_shutdown(application: Application) -> None:
+    global SCHEDULER
+    if SCHEDULER and SCHEDULER.running:
+        SCHEDULER.shutdown(wait=False)
+    SCHEDULER = None
+
+
 async def publish_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.id != REVIEW_CHAT_ID:
         return
@@ -1418,12 +1899,19 @@ async def publish_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if hasattr(builder, "post_init"):
+        builder = builder.post_init(post_init)
+    if hasattr(builder, "post_shutdown"):
+        builder = builder.post_shutdown(post_shutdown)
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("daily_report", daily_report_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("update_memory", memory_command))
+    app.add_handler(CallbackQueryHandler(draft_button_callback, pattern=r"^draft:"))
     app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, publish_latest))
     app.add_error_handler(error_handler)
